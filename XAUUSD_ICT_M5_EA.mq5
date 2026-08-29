@@ -1,669 +1,212 @@
 //+------------------------------------------------------------------+
-//|                                             XAUUSD_ICT_M5_EA.mq5 |
-//|            ICT-style Expert Advisor for XAUUSD on M5 (FX24 demo) |
+//| XAUUSD_ICT_M5_EA.mq5                                             |
+//| ICT/SMC multi-confirmation EA for XAUUSD M5                      |
+//| Safe-by-default: Demo/Strategy Tester first                      |
 //+------------------------------------------------------------------+
-#property copyright   "MetaTrader Assistant"
-#property link        ""
-#property version     "1.00"
-#property description "XAUUSD M5 EA: EMA20/50/200 + RSI filter with BOS, CHOCH, Liquidity Sweep, Order Block and FVG (ICT) pattern detection."
+#property strict
+#property version   "2.00"
+#property description "XAUUSD M5 ICT/SMC EA with MSS, BOS, CHOCH, liquidity, OB, FVG, Fibonacci, EMA, RSI and ATR confirmations."
 
-#include <Trade\Trade.mqh>
+#include <Trade/Trade.mqh>
+CTrade trade;
 
-//+------------------------------------------------------------------+
-//| Input parameters                                                 |
-//+------------------------------------------------------------------+
-input group "=== Trade settings ==="
-input double InpLotSize            = 0.01;    // Lot size (0.01 recommended)
-input int    InpStopLossPoints     = 500;     // Stop Loss in points (100 pts = 1.00 on XAUUSD)
-input int    InpTakeProfitPoints   = 1000;    // Take Profit in points
-input long   InpMagicNumber        = 250508;  // Magic number
-input bool   InpOnePositionAtATime = true;    // Only one open position at a time
-input int    InpMaxSpreadPoints    = 300;     // Max spread allowed (points)
-input int    InpSlippagePoints     = 50;      // Max slippage (points)
+input group "=== Safety / Trading ==="
+input bool   InpEnableTrading       = false;   // MUST be enabled manually after Demo validation
+input double InpLotSize              = 0.01;
+input long   InpMagicNumber          = 250508;
+input bool   InpOnePositionAtATime   = true;
+input int    InpMaxSpreadPoints      = 300;
+input int    InpSlippagePoints       = 50;
+input int    InpMaxTradesPerDay     = 3;
+input double InpMaxDailyLossMoney    = 10.0;
 
-input group "=== Indicator settings ==="
-input int    InpEmaFastPeriod      = 20;      // EMA fast period (20)
-input int    InpEmaMidPeriod       = 50;      // EMA mid period (50)
-input int    InpEmaSlowPeriod      = 200;     // EMA slow period (200)
-input int    InpRsiPeriod          = 14;      // RSI period (14)
-input double InpRsiBuyLevel        = 50.0;    // RSI buy threshold (>=)
-input double InpRsiSellLevel       = 50.0;    // RSI sell threshold (<=)
+input group "=== Risk / Exits ==="
+input int    InpATRPeriod             = 14;
+input double InpSL_ATR_Mult           = 1.5;
+input double InpTP_RR                  = 2.0;
+input int    InpMinSLPoints            = 300;
+input int    InpMaxSLPoints            = 1500;
 
-input group "=== Pattern detection settings ==="
-input bool   InpUseBOS             = true;    // Enable BOS (Break of Structure)
-input bool   InpUseCHOCH           = true;    // Enable CHOCH (Change of Character)
-input bool   InpUseLiquiditySweep  = true;    // Enable Liquidity Sweep
-input bool   InpUseOrderBlock      = true;    // Enable Order Block
-input bool   InpUseFVG             = true;    // Enable FVG (Fair Value Gap)
-input int    InpSwingStrength      = 2;       // Swing points strength (bars each side)
-input int    InpSwingLookback      = 15;      // Swing points search window (bars)
-input int    InpFreshBars          = 5;       // Pattern freshness window (bars)
-input int    InpOrderBlockLookback = 20;      // Order Block search window (bars)
-input int    InpFVGLookback        = 20;      // FVG search window (bars)
-input int    InpMinImpulsePoints   = 250;     // Min impulse move for Order Block (points)
-input bool   InpDebugPrints        = false;   // Print detected patterns on every bar
+input group "=== EMA / RSI ==="
+input int    InpEmaFastPeriod          = 20;
+input int    InpEmaMidPeriod           = 50;
+input int    InpEmaSlowPeriod          = 200;
+input int    InpRsiPeriod              = 14;
+input double InpRsiBuyLevel            = 52.0;
+input double InpRsiSellLevel           = 48.0;
 
-//+------------------------------------------------------------------+
-//| Globals                                                          |
-//+------------------------------------------------------------------+
-CTrade   trade;
-int      hEmaFast = INVALID_HANDLE;
-int      hEmaMid  = INVALID_HANDLE;
-int      hEmaSlow = INVALID_HANDLE;
-int      hRSI     = INVALID_HANDLE;
-double   gEmaFast[];
-double   gEmaMid[];
-double   gEmaSlow[];
-double   gRSI[];
-datetime gLastBarTime = 0;
+input group "=== Structure / ICT ==="
+input int    InpSwingStrength          = 2;
+input int    InpSwingLookback          = 80;
+input int    InpStructureBufferPoints  = 10;
+input int    InpFreshBars              = 8;
+input int    InpMinImpulsePoints       = 150;
 
-#define EA_NEED_BARS 300   // minimum bars to be loaded for a stable EMA200
+input group "=== Fibonacci ==="
+input bool   InpUseFibonacci           = true;
+input double InpFibMin                 = 0.618;
+input double InpFibOTE1                = 0.705;
+input double InpFibOTE2                = 0.786;
+input double InpFibMax                 = 0.786;
+input int    InpFibTolerancePoints     = 100;
 
-//--- prototypes
-bool   IsNewBar();
-bool   InitIndicatorHandles();
-bool   UpdateIndicatorBuffers(int needBars);
-bool   CanTrade();
-bool   HasOpenPosition();
-int    FindLatestSwingHigh(const MqlRates &r[], int fromShift, int toShift, int strength);
-int    FindLatestSwingLow (const MqlRates &r[], int fromShift, int toShift, int strength);
-bool   SignalBullishBOS(const MqlRates &r[], int total);
-bool   SignalBearishBOS(const MqlRates &r[], int total);
-bool   SignalBullishCHOCH(const MqlRates &r[], int total);
-bool   SignalBearishCHOCH(const MqlRates &r[], int total);
-bool   SignalBullishSweep(const MqlRates &r[], int total);
-bool   SignalBearishSweep(const MqlRates &r[], int total);
-bool   SignalBullishOB(const MqlRates &r[], int total);
-bool   SignalBearishOB(const MqlRates &r[], int total);
-bool   SignalBullishFVG(const MqlRates &r[], int total);
-bool   SignalBearishFVG(const MqlRates &r[], int total);
-bool   PlaceOrder(bool isBuy, string reason);
+input group "=== Confirmation Score ==="
+input bool   InpRequireLiquidity       = true;
+input bool   InpRequireStructure       = true;
+input int    InpMinScore               = 7;
+input bool   InpDebugPrints            = true;
 
-//+------------------------------------------------------------------+
-//| Expert initialization function                                   |
-//+------------------------------------------------------------------+
+int hEma20=INVALID_HANDLE,hEma50=INVALID_HANDLE,hEma200=INVALID_HANDLE,hRSI=INVALID_HANDLE,hATR=INVALID_HANDLE;
+double ema20[],ema50[],ema200[],rsi[],atr[];
+datetime lastBar=0;
+int tradesToday=0;
+datetime dayStart=0;
+
+enum Direction { DIR_NONE=0, DIR_BUY=1, DIR_SELL=-1 };
+
+bool IsNewBar();
+bool LoadIndicators();
+bool CanTrade();
+bool HasPosition();
+int  SwingHigh(const MqlRates &r[],int total,int fromShift);
+int  SwingLow(const MqlRates &r[],int total,int fromShift);
+bool BullBOS(const MqlRates &r[],int total);
+bool BearBOS(const MqlRates &r[],int total);
+bool BullCHOCH(const MqlRates &r[],int total);
+bool BearCHOCH(const MqlRates &r[],int total);
+bool BullMSS(const MqlRates &r[],int total);
+bool BearMSS(const MqlRates &r[],int total);
+bool BullSweep(const MqlRates &r[],int total);
+bool BearSweep(const MqlRates &r[],int total);
+bool BullOB(const MqlRates &r[],int total);
+bool BearOB(const MqlRates &r[],int total);
+bool BullFVG(const MqlRates &r[],int total);
+bool BearFVG(const MqlRates &r[],int total);
+bool BullFib(const MqlRates &r[],int total);
+bool BearFib(const MqlRates &r[],int total);
+void EvaluateAndTrade(const MqlRates &r[],int total);
+bool PlaceOrder(bool buy,string reason);
+void ResetDailyCounters();
+
 int OnInit()
 {
-   trade.SetExpertMagicNumber(InpMagicNumber);
-   trade.SetDeviationInPoints(InpSlippagePoints);
-   trade.SetTypeFillingBySymbol(_Symbol);
-
-   if(!InitIndicatorHandles())
-      return(INIT_FAILED);
-
-   if(InpLotSize <= 0.0)
-      Print("Warning: invalid lot size, using 0.01.");
-   if(InpStopLossPoints <= 0)
-      Print("Warning: Stop Loss is disabled (0).");
-   if(InpTakeProfitPoints <= 0)
-      Print("Warning: Take Profit is disabled (0).");
-
-   Print("XAUUSD_ICT_M5_EA initialized. Symbol = ", _Symbol,
-         ", Period = ", EnumToString(Period()));
-   return(INIT_SUCCEEDED);
+ trade.SetExpertMagicNumber(InpMagicNumber); trade.SetDeviationInPoints(InpSlippagePoints); trade.SetTypeFillingBySymbol(_Symbol);
+ hEma20=iMA(_Symbol,PERIOD_CURRENT,InpEmaFastPeriod,0,MODE_EMA,PRICE_CLOSE);
+ hEma50=iMA(_Symbol,PERIOD_CURRENT,InpEmaMidPeriod,0,MODE_EMA,PRICE_CLOSE);
+ hEma200=iMA(_Symbol,PERIOD_CURRENT,InpEmaSlowPeriod,0,MODE_EMA,PRICE_CLOSE);
+ hRSI=iRSI(_Symbol,PERIOD_CURRENT,InpRsiPeriod,PRICE_CLOSE);
+ hATR=iATR(_Symbol,PERIOD_CURRENT,InpATRPeriod);
+ if(hEma20==INVALID_HANDLE||hEma50==INVALID_HANDLE||hEma200==INVALID_HANDLE||hRSI==INVALID_HANDLE||hATR==INVALID_HANDLE) return INIT_FAILED;
+ ResetDailyCounters();
+ Print("XAUUSD ICT M5 EA v2.00 initialized. Trading=",InpEnableTrading," Symbol=",_Symbol," TF=",EnumToString(Period()));
+ return INIT_SUCCEEDED;
 }
-
-//+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
-//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(hEmaFast != INVALID_HANDLE) IndicatorRelease(hEmaFast);
-   if(hEmaMid  != INVALID_HANDLE) IndicatorRelease(hEmaMid);
-   if(hEmaSlow != INVALID_HANDLE) IndicatorRelease(hEmaSlow);
-   if(hRSI     != INVALID_HANDLE) IndicatorRelease(hRSI);
-   Print("XAUUSD_ICT_M5_EA deinitialized. Reason code = ", reason);
+ if(hEma20!=INVALID_HANDLE)IndicatorRelease(hEma20); if(hEma50!=INVALID_HANDLE)IndicatorRelease(hEma50); if(hEma200!=INVALID_HANDLE)IndicatorRelease(hEma200); if(hRSI!=INVALID_HANDLE)IndicatorRelease(hRSI); if(hATR!=INVALID_HANDLE)IndicatorRelease(hATR);
 }
-
-//+------------------------------------------------------------------+
-//| Expert tick function                                             |
-//+------------------------------------------------------------------+
 void OnTick()
 {
-   //--- work only once on each new (completed) bar
-   if(!IsNewBar())
-      return;
-
-   int needBars = EA_NEED_BARS;
-   if(!UpdateIndicatorBuffers(needBars))
-      return;
-
-   MqlRates rates[];
-   ArraySetAsSeries(rates, true);
-   int copied = CopyRates(_Symbol, PERIOD_CURRENT, 0, needBars, rates);
-   if(copied < needBars)
-   {
-      Print("Not enough bars copied: ", copied);
-      return;
-   }
-
-   if(!CanTrade())
-      return;
-
-   if(InpOnePositionAtATime && HasOpenPosition())
-      return;
-
-   //--- collect all pattern signals
-   bool bosB  = InpUseBOS            ? SignalBullishBOS(rates, copied)   : false;
-   bool bosS  = InpUseBOS            ? SignalBearishBOS(rates, copied)   : false;
-   bool chB   = InpUseCHOCH          ? SignalBullishCHOCH(rates, copied) : false;
-   bool chS   = InpUseCHOCH          ? SignalBearishCHOCH(rates, copied) : false;
-   bool swB   = InpUseLiquiditySweep ? SignalBullishSweep(rates, copied) : false;
-   bool swS   = InpUseLiquiditySweep ? SignalBearishSweep(rates, copied) : false;
-   bool obB   = InpUseOrderBlock     ? SignalBullishOB(rates, copied)    : false;
-   bool obS   = InpUseOrderBlock     ? SignalBearishOB(rates, copied)    : false;
-   bool fvgB  = InpUseFVG            ? SignalBullishFVG(rates, copied)   : false;
-   bool fvgS  = InpUseFVG            ? SignalBearishFVG(rates, copied)   : false;
-
-   //--- optional debug print (useful in the Strategy Tester)
-   if(InpDebugPrints)
-   {
-      Print("[ICT] BOS(", bosB, "/", bosS, ") CHOCH(", chB, "/", chS,
-            ") SWEEP(", swB, "/", swS, ") OB(", obB, "/", obS,
-            ") FVG(", fvgB, "/", fvgS, ")");
-   }
-
-   //--- trend filter: EMA alignment
-   bool trendUp   = (gEmaFast[1] > gEmaMid[1] && gEmaMid[1] > gEmaSlow[1]);
-   bool trendDown = (gEmaFast[1] < gEmaMid[1] && gEmaMid[1] < gEmaSlow[1]);
-
-   //--- momentum filter: RSI
-   bool rsiUp   = (gRSI[1] >= InpRsiBuyLevel);
-   bool rsiDown = (gRSI[1] <= InpRsiSellLevel);
-
-   //--- BUY logic: uptrend + RSI + at least one bullish ICT pattern
-   string reason = "";
-   bool doBuy  = false;
-   bool doSell = false;
-
-   if(trendUp && rsiUp)
-   {
-      if(bosB)       { doBuy = true; reason = "BOS"; }
-      else if(chB)   { doBuy = true; reason = "CHOCH"; }
-      else if(swB)   { doBuy = true; reason = "Liquidity Sweep"; }
-      else if(obB)   { doBuy = true; reason = "Order Block"; }
-      else if(fvgB)  { doBuy = true; reason = "FVG"; }
-   }
-
-   //--- SELL logic: downtrend + RSI + at least one bearish ICT pattern
-   if(trendDown && rsiDown)
-   {
-      if(bosS)       { doSell = true; reason = "BOS"; }
-      else if(chS)   { doSell = true; reason = "CHOCH"; }
-      else if(swS)   { doSell = true; reason = "Liquidity Sweep"; }
-      else if(obS)   { doSell = true; reason = "Order Block"; }
-      else if(fvgS)  { doSell = true; reason = "FVG"; }
-   }
-
-   //--- execute one direction only
-   if(doBuy && !doSell)
-   {
-      if(PlaceOrder(true, reason))
-         Print("BUY signal fired (", reason, ") at ", TimeToString(TimeCurrent()));
-   }
-   else if(doSell && !doBuy)
-   {
-      if(PlaceOrder(false, reason))
-         Print("SELL signal fired (", reason, ") at ", TimeToString(TimeCurrent()));
-   }
+ if(!IsNewBar()) return;
+ if(!LoadIndicators()) return;
+ MqlRates r[]; ArraySetAsSeries(r,true); int n=CopyRates(_Symbol,PERIOD_CURRENT,0,350,r); if(n<250)return;
+ ResetDailyCounters();
+ if(!CanTrade())return;
+ if(InpOnePositionAtATime&&HasPosition())return;
+ EvaluateAndTrade(r,n);
 }
 
-//+------------------------------------------------------------------+
-//| Create indicator handles                                         |
-//+------------------------------------------------------------------+
-bool InitIndicatorHandles()
+bool IsNewBar(){ datetime t=(datetime)SeriesInfoInteger(_Symbol,PERIOD_CURRENT,SERIES_LASTBAR_TIME); if(t!=lastBar){lastBar=t;return true;} return false; }
+
+bool LoadIndicators()
 {
-   hEmaFast = iMA(_Symbol, PERIOD_CURRENT, InpEmaFastPeriod, 0, MODE_EMA, PRICE_CLOSE);
-   hEmaMid  = iMA(_Symbol, PERIOD_CURRENT, InpEmaMidPeriod,  0, MODE_EMA, PRICE_CLOSE);
-   hEmaSlow = iMA(_Symbol, PERIOD_CURRENT, InpEmaSlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
-   hRSI     = iRSI(_Symbol, PERIOD_CURRENT, InpRsiPeriod, PRICE_CLOSE);
-
-   if(hEmaFast == INVALID_HANDLE || hEmaMid == INVALID_HANDLE ||
-      hEmaSlow == INVALID_HANDLE || hRSI == INVALID_HANDLE)
-   {
-      Print("Failed to create indicator handles. Error: ", GetLastError());
-      return(false);
-   }
-   return(true);
+ ArraySetAsSeries(ema20,true);ArraySetAsSeries(ema50,true);ArraySetAsSeries(ema200,true);ArraySetAsSeries(rsi,true);ArraySetAsSeries(atr,true);
+ int n=350;
+ return CopyBuffer(hEma20,0,0,n,ema20)>=n && CopyBuffer(hEma50,0,0,n,ema50)>=n && CopyBuffer(hEma200,0,0,n,ema200)>=n && CopyBuffer(hRSI,0,0,n,rsi)>=n && CopyBuffer(hATR,0,0,n,atr)>=n;
 }
 
-//+------------------------------------------------------------------+
-//| Copy fresh indicator values                                      |
-//+------------------------------------------------------------------+
-bool UpdateIndicatorBuffers(int needBars)
+void ResetDailyCounters()
 {
-   if(Bars(_Symbol, PERIOD_CURRENT) < needBars)
-   {
-      Print("Not enough bars on the chart: ", Bars(_Symbol, PERIOD_CURRENT));
-      return(false);
-   }
-
-   ArraySetAsSeries(gEmaFast, true);
-   ArraySetAsSeries(gEmaMid,  true);
-   ArraySetAsSeries(gEmaSlow, true);
-   ArraySetAsSeries(gRSI,     true);
-
-   if(CopyBuffer(hEmaFast, 0, 0, needBars, gEmaFast) < needBars) return(false);
-   if(CopyBuffer(hEmaMid,  0, 0, needBars, gEmaMid)  < needBars) return(false);
-   if(CopyBuffer(hEmaSlow, 0, 0, needBars, gEmaSlow) < needBars) return(false);
-   if(CopyBuffer(hRSI,     0, 0, needBars, gRSI)     < needBars) return(false);
-
-   return(true);
+ MqlDateTime d; TimeToStruct(TimeCurrent(),d); d.hour=0;d.min=0;d.sec=0; datetime ds=StructToTime(d);
+ if(ds!=dayStart){dayStart=ds;tradesToday=0;}
 }
 
-//+------------------------------------------------------------------+
-//| Detect a new closed bar                                          |
-//+------------------------------------------------------------------+
-bool IsNewBar()
-{
-   datetime t = (datetime)SeriesInfoInteger(_Symbol, PERIOD_CURRENT, SERIES_LASTBAR_TIME);
-   if(t != gLastBarTime)
-   {
-      gLastBarTime = t;
-      return(true);
-   }
-   return(false);
-}
-
-//+------------------------------------------------------------------+
-//| Pre-trade safety checks                                          |
-//+------------------------------------------------------------------+
 bool CanTrade()
 {
-   long tradeMode = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
-   if(tradeMode != SYMBOL_TRADE_MODE_FULL &&
-      tradeMode != SYMBOL_TRADE_MODE_LONG &&
-      tradeMode != SYMBOL_TRADE_MODE_SHORT)
-   {
-      Print("Trading is disabled for ", _Symbol, " (trade mode = ", tradeMode, ")");
-      return(false);
-   }
-
-   long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-   if(spread > InpMaxSpreadPoints)
-   {
-      Print("Spread too high: ", spread, " points (max ", InpMaxSpreadPoints, "). Skipping.");
-      return(false);
-   }
-
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double margin = 0.0;
-   if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, InpLotSize, ask, margin))
-   {
-      Print("OrderCalcMargin failed. Error: ", GetLastError());
-      return(false);
-   }
-   if(margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
-   {
-      Print("Not enough free margin: need ", margin, ", available ",
-            AccountInfoDouble(ACCOUNT_MARGIN_FREE));
-      return(false);
-   }
-
-   return(true);
+ if(!InpEnableTrading)return false;
+ long mode=SymbolInfoInteger(_Symbol,SYMBOL_TRADE_MODE); if(mode!=SYMBOL_TRADE_MODE_FULL&&mode!=SYMBOL_TRADE_MODE_LONG&&mode!=SYMBOL_TRADE_MODE_SHORT)return false;
+ long spread=SymbolInfoInteger(_Symbol,SYMBOL_SPREAD); if(spread>InpMaxSpreadPoints)return false;
+ if(tradesToday>=InpMaxTradesPerDay)return false;
+ if(InpMaxDailyLossMoney>0)
+ {
+  double pnl=0; HistorySelect(dayStart,TimeCurrent()); int deals=HistoryDealsTotal();
+  for(int i=0;i<deals;i++){ulong tk=HistoryDealGetTicket(i); if(tk>0 && HistoryDealGetString(tk,DEAL_SYMBOL)==_Symbol && HistoryDealGetInteger(tk,DEAL_MAGIC)==InpMagicNumber) pnl+=HistoryDealGetDouble(tk,DEAL_PROFIT)+HistoryDealGetDouble(tk,DEAL_SWAP)+HistoryDealGetDouble(tk,DEAL_COMMISSION);}
+  if(pnl<=-InpMaxDailyLossMoney)return false;
+ }
+ return true;
 }
 
-//+------------------------------------------------------------------+
-//| Check for an open position with our magic number                 |
-//+------------------------------------------------------------------+
-bool HasOpenPosition()
+bool HasPosition()
 {
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      if(PositionGetTicket(i) == 0)
-         continue;
-      if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
-         PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
-         return(true);
-   }
-   return(false);
+ for(int i=PositionsTotal()-1;i>=0;i--){ulong tk=PositionGetTicket(i);if(tk>0&&PositionGetString(POSITION_SYMBOL)==_Symbol&&PositionGetInteger(POSITION_MAGIC)==InpMagicNumber)return true;} return false;
 }
 
-//+------------------------------------------------------------------+
-//| Swing point helpers (as-series shifts)                           |
-//+------------------------------------------------------------------+
-bool IsSwingHighAt(const MqlRates &r[], int s, int strength)
+bool IsSH(const MqlRates&r[],int s,int st){if(s-st<1)return false;double h=r[s].high;for(int k=1;k<=st;k++)if(r[s-k].high>=h||r[s+k].high>=h)return false;return true;}
+bool IsSL(const MqlRates&r[],int s,int st){if(s-st<1)return false;double l=r[s].low;for(int k=1;k<=st;k++)if(r[s-k].low<=l||r[s+k].low<=l)return false;return true;}
+int SwingHigh(const MqlRates&r[],int total,int from){int end=MathMin(total-InpSwingStrength-1,from+InpSwingLookback);for(int s=from;s<=end;s++)if(IsSH(r,s,InpSwingStrength))return s;return -1;}
+int SwingLow(const MqlRates&r[],int total,int from){int end=MathMin(total-InpSwingStrength-1,from+InpSwingLookback);for(int s=from;s<=end;s++)if(IsSL(r,s,InpSwingStrength))return s;return -1;}
+
+bool BullBOS(const MqlRates&r[],int n){int h=SwingHigh(r,n,InpSwingStrength+1);return h>0&&r[1].close>r[h].high+InpStructureBufferPoints*_Point;}
+bool BearBOS(const MqlRates&r[],int n){int l=SwingLow(r,n,InpSwingStrength+1);return l>0&&r[1].close<r[l].low-InpStructureBufferPoints*_Point;}
+bool BullCHOCH(const MqlRates&r[],int n){int l=SwingLow(r,n,InpSwingStrength+1);int h=SwingHigh(r,n,InpSwingStrength+1);return l>0&&h>0&&r[h].high<r[h+MathMin(10,n-h-1)].high&&r[1].close>r[h].high;}
+bool BearCHOCH(const MqlRates&r[],int n){int h=SwingHigh(r,n,InpSwingStrength+1);int l=SwingLow(r,n,InpSwingStrength+1);return h>0&&l>0&&r[l].low>r[l+MathMin(10,n-l-1)].low&&r[1].close<r[l].low;}
+bool BullMSS(const MqlRates&r[],int n){return BullCHOCH(r,n)||BullBOS(r,n);}
+bool BearMSS(const MqlRates&r[],int n){return BearCHOCH(r,n)||BearBOS(r,n);}
+
+bool BullSweep(const MqlRates&r[],int n){int l=SwingLow(r,n,InpSwingStrength+1);return l>0&&r[1].low<r[l].low-InpStructureBufferPoints*_Point&&r[1].close>r[l].low;}
+bool BearSweep(const MqlRates&r[],int n){int h=SwingHigh(r,n,InpSwingStrength+1);return h>0&&r[1].high>r[h].high+InpStructureBufferPoints*_Point&&r[1].close<r[h].high;}
+
+bool BullOB(const MqlRates&r[],int n){for(int s=2;s<=InpFreshBars+2&&s<n-2;s++){if(r[s].close<r[s].open){double imp=r[s-1].high-r[s].low;if(imp>=InpMinImpulsePoints*_Point&&r[1].close>r[s].high)return true;}}return false;}
+bool BearOB(const MqlRates&r[],int n){for(int s=2;s<=InpFreshBars+2&&s<n-2;s++){if(r[s].close>r[s].open){double imp=r[s].high-r[s-1].low;if(imp>=InpMinImpulsePoints*_Point&&r[1].close<r[s].low)return true;}}return false;}
+
+bool BullFVG(const MqlRates&r[],int n){for(int s=1;s<=InpFreshBars&&s+2<n;s++)if(r[s].low>r[s+2].high)return true;return false;}
+bool BearFVG(const MqlRates&r[],int n){for(int s=1;s<=InpFreshBars&&s+2<n;s++)if(r[s].high<r[s+2].low)return true;return false;}
+
+bool InFib(double price,double a,double b)
 {
-   if(s - strength < 1)
-      return(false);
-   double h = r[s].high;
-   for(int k = 1; k <= strength; k++)
-   {
-      if(r[s - k].high >= h || r[s + k].high >= h)
-         return(false);
-   }
-   return(true);
+ double hi=MathMax(a,b),lo=MathMin(a,b),range=hi-lo;if(range<=0)return false;
+ double z1=hi-range*InpFibMin,z2=hi-range*InpFibMax; double z3=hi-range*InpFibOTE1,z4=hi-range*InpFibOTE2;
+ double minz=MathMin(MathMin(z1,z2),MathMin(z3,z4)),maxz=MathMax(MathMax(z1,z2),MathMax(z3,z4));
+ return price>=minz-InpFibTolerancePoints*_Point&&price<=maxz+InpFibTolerancePoints*_Point;
+}
+bool BearInFib(double price,double a,double b)
+{
+ double hi=MathMax(a,b),lo=MathMin(a,b),range=hi-lo;if(range<=0)return false;
+ double z1=lo+range*InpFibMin,z2=lo+range*InpFibMax,z3=lo+range*InpFibOTE1,z4=lo+range*InpFibOTE2;
+ double minz=MathMin(MathMin(z1,z2),MathMin(z3,z4)),maxz=MathMax(MathMax(z1,z2),MathMax(z3,z4));
+ return price>=minz-InpFibTolerancePoints*_Point&&price<=maxz+InpFibTolerancePoints*_Point;
+}
+bool BullFib(const MqlRates&r[],int n){int h=SwingHigh(r,n,InpSwingStrength+1),l=SwingLow(r,n,InpSwingStrength+1);return h>0&&l>0&&h<l&&InFib(r[1].close,r[h].high,r[l].low);}
+bool BearFib(const MqlRates&r[],int n){int h=SwingHigh(r,n,InpSwingStrength+1),l=SwingLow(r,n,InpSwingStrength+1);return h>0&&l>0&&l<h&&BearInFib(r[1].close,r[l].low,r[h].high);}
+
+void EvaluateAndTrade(const MqlRates&r[],int n)
+{
+ bool up=ema20[1]>ema50[1]&&ema50[1]>ema200[1],dn=ema20[1]<ema50[1]&&ema50[1]<ema200[1];
+ bool rb=rsi[1]>=InpRsiBuyLevel,rs=rsi[1]<=InpRsiSellLevel;
+ bool msb=BullMSS(r,n),mss=BearMSS(r,n),swb=BullSweep(r,n),sws=BearSweep(r,n),obb=BullOB(r,n),obs=BearOB(r,n),fvgb=BullFVG(r,n),fvgs=BearFVG(r,n),fibB=!InpUseFibonacci||BullFib(r,n),fibS=!InpUseFibonacci||BearFib(r,n);
+ int buy=0,sell=0;if(up)buy+=2;if(dn)sell+=2;if(rb)buy++;if(rs)sell++;if(msb)buy+=2;if(mss)sell+=2;if(swb)buy+=2;if(sws)sell+=2;if(obb)buy++;if(obs)sell++;if(fvgb)buy++;if(fvgs)sell++;if(fibB)buy++;if(fibS)sell++;
+ if(InpRequireLiquidity&&!swb)buy=0;if(InpRequireLiquidity&&!sws)sell=0;if(InpRequireStructure&&!msb)buy=0;if(InpRequireStructure&&!mss)sell=0;
+ if(InpDebugPrints)PrintFormat("ICT score BUY=%d SELL=%d | MSS %d/%d Sweep %d/%d OB %d/%d FVG %d/%d Fib %d/%d EMA %d/%d RSI %.1f",buy,sell,msb,mss,swb,sws,obb,obs,fvgb,fvgs,fibB,fibS,rsi[1]);
+ if(buy>=InpMinScore&&buy>sell){string why="MSS+Sweep";if(fibB)why+="+Fib";if(obb)why+="+OB";if(fvgb)why+="+FVG";PlaceOrder(true,why);}
+ else if(sell>=InpMinScore&&sell>buy){string why="MSS+Sweep";if(fibS)why+="+Fib";if(obs)why+="+OB";if(fvgs)why+="+FVG";PlaceOrder(false,why);}
 }
 
-bool IsSwingLowAt(const MqlRates &r[], int s, int strength)
+bool PlaceOrder(bool buy,string reason)
 {
-   if(s - strength < 1)
-      return(false);
-   double l = r[s].low;
-   for(int k = 1; k <= strength; k++)
-   {
-      if(r[s - k].low <= l || r[s + k].low <= l)
-         return(false);
-   }
-   return(true);
-}
-
-int FindLatestSwingHigh(const MqlRates &r[], int fromShift, int toShift, int strength)
-{
-   for(int s = fromShift; s <= toShift; s++)
-   {
-      if(IsSwingHighAt(r, s, strength))
-         return(s);
-   }
-   return(-1);
-}
-
-int FindLatestSwingLow(const MqlRates &r[], int fromShift, int toShift, int strength)
-{
-   for(int s = fromShift; s <= toShift; s++)
-   {
-      if(IsSwingLowAt(r, s, strength))
-         return(s);
-   }
-   return(-1);
-}
-
-//+------------------------------------------------------------------+
-//| BOS - Break of Structure                                         |
-//| Bullish: price closed above the most recent swing high.         |
-//| Bearish: price closed below the most recent swing low.          |
-//+------------------------------------------------------------------+
-bool SignalBullishBOS(const MqlRates &r[], int total)
-{
-   if(total < 40)
-      return(false);
-   int fromShift = 1 + InpSwingStrength;
-   int toShift   = fromShift + InpSwingLookback;
-   int s = FindLatestSwingHigh(r, fromShift, toShift, InpSwingStrength);
-   if(s < 0)
-      return(false);
-   for(int b = 1; b < s; b++)
-   {
-      if(b > InpFreshBars)
-         break;
-      if(r[b].close > r[s].high)
-         return(true);
-   }
-   return(false);
-}
-
-bool SignalBearishBOS(const MqlRates &r[], int total)
-{
-   if(total < 40)
-      return(false);
-   int fromShift = 1 + InpSwingStrength;
-   int toShift   = fromShift + InpSwingLookback;
-   int s = FindLatestSwingLow(r, fromShift, toShift, InpSwingStrength);
-   if(s < 0)
-      return(false);
-   for(int b = 1; b < s; b++)
-   {
-      if(b > InpFreshBars)
-         break;
-      if(r[b].close < r[s].low)
-         return(true);
-   }
-   return(false);
-}
-
-//+------------------------------------------------------------------+
-//| CHOCH - Change of Character                                      |
-//| Bullish: prior downtrend, then price closed above last swing    |
-//|          high (character changed to bullish).                    |
-//| Bearish: prior uptrend, then price closed below last swing low. |
-//+------------------------------------------------------------------+
-bool SignalBullishCHOCH(const MqlRates &r[], int total)
-{
-   if(total < 40)
-      return(false);
-   //--- trend was down a few bars ago
-   if(gEmaFast[3] >= gEmaMid[3])
-      return(false);
-   int fromShift = 1 + InpSwingStrength;
-   int toShift   = fromShift + InpSwingLookback;
-   int s = FindLatestSwingHigh(r, fromShift, toShift, InpSwingStrength);
-   if(s < 0)
-      return(false);
-   for(int b = 1; b < s; b++)
-   {
-      if(b > InpFreshBars)
-         break;
-      if(r[b].close > r[s].high)
-         return(true);
-   }
-   return(false);
-}
-
-bool SignalBearishCHOCH(const MqlRates &r[], int total)
-{
-   if(total < 40)
-      return(false);
-   //--- trend was up a few bars ago
-   if(gEmaFast[3] <= gEmaMid[3])
-      return(false);
-   int fromShift = 1 + InpSwingStrength;
-   int toShift   = fromShift + InpSwingLookback;
-   int s = FindLatestSwingLow(r, fromShift, toShift, InpSwingStrength);
-   if(s < 0)
-      return(false);
-   for(int b = 1; b < s; b++)
-   {
-      if(b > InpFreshBars)
-         break;
-      if(r[b].close < r[s].low)
-         return(true);
-   }
-   return(false);
-}
-
-//+------------------------------------------------------------------+
-//| Liquidity Sweep (stop hunt)                                      |
-//| Bullish: a recent bar wicks below a swing low but closes above  |
-//|          it (sell-side liquidity swept, reversal expected).      |
-//| Bearish: a recent bar wicks above a swing high but closes below |
-//|          it.                                                     |
-//+------------------------------------------------------------------+
-bool SignalBullishSweep(const MqlRates &r[], int total)
-{
-   if(total < 40)
-      return(false);
-   int fromShift = 1 + InpSwingStrength;
-   int toShift   = fromShift + InpSwingLookback;
-   int s = FindLatestSwingLow(r, fromShift, toShift, InpSwingStrength);
-   if(s < 0)
-      return(false);
-   for(int b = 1; b < s; b++)
-   {
-      if(b > InpFreshBars)
-         break;
-      if(r[b].low < r[s].low && r[b].close > r[s].low)
-         return(true);
-   }
-   return(false);
-}
-
-bool SignalBearishSweep(const MqlRates &r[], int total)
-{
-   if(total < 40)
-      return(false);
-   int fromShift = 1 + InpSwingStrength;
-   int toShift   = fromShift + InpSwingLookback;
-   int s = FindLatestSwingHigh(r, fromShift, toShift, InpSwingStrength);
-   if(s < 0)
-      return(false);
-   for(int b = 1; b < s; b++)
-   {
-      if(b > InpFreshBars)
-         break;
-      if(r[b].high > r[s].high && r[b].close < r[s].high)
-         return(true);
-   }
-   return(false);
-}
-
-//+------------------------------------------------------------------+
-//| Order Block (ICT)                                                |
-//| Bullish: last bearish candle before a strong bullish impulse,   |
-//|          then price retests the OB zone.                         |
-//| Bearish: last bullish candle before a strong bearish impulse,   |
-//|          then price retests the OB zone.                         |
-//+------------------------------------------------------------------+
-bool SignalBullishOB(const MqlRates &r[], int total)
-{
-   if(total < 40)
-      return(false);
-   double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double minMove = InpMinImpulsePoints * point;
-   int limit = (int)MathMin((double)InpOrderBlockLookback, (double)(total - 3));
-
-   for(int s = 2; s <= limit; s++)
-   {
-      //--- OB candle must be bearish
-      if(r[s].close >= r[s].open)
-         continue;
-      //--- next (more recent) candle must be a strong bullish impulse
-      int s1 = s - 1;
-      if(r[s1].close <= r[s1].open)
-         continue;
-      if((r[s1].close - r[s1].open) < minMove)
-         continue;
-      if(r[s1].close <= r[s].high)
-         continue;
-      //--- retest: the last closed bar overlapped the OB zone
-      if(r[1].low <= r[s].high && r[1].high >= r[s].low)
-         return(true);
-   }
-   return(false);
-}
-
-bool SignalBearishOB(const MqlRates &r[], int total)
-{
-   if(total < 40)
-      return(false);
-   double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double minMove = InpMinImpulsePoints * point;
-   int limit = (int)MathMin((double)InpOrderBlockLookback, (double)(total - 3));
-
-   for(int s = 2; s <= limit; s++)
-   {
-      //--- OB candle must be bullish
-      if(r[s].close <= r[s].open)
-         continue;
-      //--- next (more recent) candle must be a strong bearish impulse
-      int s1 = s - 1;
-      if(r[s1].close >= r[s1].open)
-         continue;
-      if((r[s1].open - r[s1].close) < minMove)
-         continue;
-      if(r[s1].close >= r[s].low)
-         continue;
-      //--- retest: the last closed bar overlapped the OB zone
-      if(r[1].low <= r[s].high && r[1].high >= r[s].low)
-         return(true);
-   }
-   return(false);
-}
-
-//+------------------------------------------------------------------+
-//| FVG - Fair Value Gap                                             |
-//| Bullish: low of the newest candle above high of the oldest      |
-//|          candle in a 3-candle sequence, then price retests the  |
-//|          gap.                                                    |
-//| Bearish: the mirror image.                                       |
-//+------------------------------------------------------------------+
-bool SignalBullishFVG(const MqlRates &r[], int total)
-{
-   if(total < 40)
-      return(false);
-   int limit = (int)MathMin((double)InpFVGLookback, (double)(total - 3));
-
-   for(int s = 2; s <= limit; s++)
-   {
-      //--- bullish gap: low(s) > high(s+2)
-      if(r[s].low <= r[s + 2].high)
-         continue;
-      //--- freshness
-      if(s > InpFreshBars + 2)
-         continue;
-      //--- retest: last closed bar overlapped the gap zone
-      if(r[1].high >= r[s + 2].high && r[1].low <= r[s].low)
-         return(true);
-   }
-   return(false);
-}
-
-bool SignalBearishFVG(const MqlRates &r[], int total)
-{
-   if(total < 40)
-      return(false);
-   int limit = (int)MathMin((double)InpFVGLookback, (double)(total - 3));
-
-   for(int s = 2; s <= limit; s++)
-   {
-      //--- bearish gap: high(s) < low(s+2)
-      if(r[s].high >= r[s + 2].low)
-         continue;
-      //--- freshness
-      if(s > InpFreshBars + 2)
-         continue;
-      //--- retest: last closed bar overlapped the gap zone
-      if(r[1].low <= r[s + 2].low && r[1].high >= r[s].high)
-         return(true);
-   }
-   return(false);
-}
-
-//+------------------------------------------------------------------+
-//| Place a market order with SL/TP                                  |
-//+------------------------------------------------------------------+
-bool PlaceOrder(bool isBuy, string reason)
-{
-   double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double price  = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
-                         : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double sl = 0.0;
-   double tp = 0.0;
-
-   if(InpStopLossPoints > 0)
-      sl = isBuy ? price - InpStopLossPoints * point
-                 : price + InpStopLossPoints * point;
-   if(InpTakeProfitPoints > 0)
-      tp = isBuy ? price + InpTakeProfitPoints * point
-                 : price - InpTakeProfitPoints * point;
-
-   //--- enforce broker minimum stop distance
-   long stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   if(stopsLevel > 0)
-   {
-      double minDist = stopsLevel * point;
-      if(sl > 0.0 && MathAbs(sl - price) < minDist)
-         sl = isBuy ? price - minDist : price + minDist;
-      if(tp > 0.0 && MathAbs(tp - price) < minDist)
-         tp = isBuy ? price + minDist : price - minDist;
-   }
-
-   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   sl = NormalizeDouble(sl, digits);
-   tp = NormalizeDouble(tp, digits);
-
-   string comment = "ICT_" + reason;
-   bool ok = false;
-
-   if(isBuy)
-      ok = trade.Buy(InpLotSize, _Symbol, 0.0, sl, tp, comment);
-   else
-      ok = trade.Sell(InpLotSize, _Symbol, 0.0, sl, tp, comment);
-
-   if(!ok)
-   {
-      Print("Order failed. Retcode = ", trade.ResultRetcode(),
-            " (", trade.ResultRetcodeDescription(), "), error = ", GetLastError());
-   }
-   return(ok);
+ double price=buy?SymbolInfoDouble(_Symbol,SYMBOL_ASK):SymbolInfoDouble(_Symbol,SYMBOL_BID); double a=atr[1];if(a<=0)return false;
+ int slPts=(int)MathRound(a/_Point*InpSL_ATR_Mult);slPts=MathMax(InpMinSLPoints,MathMin(InpMaxSLPoints,slPts));int tpPts=(int)MathRound(slPts*InpTP_RR);
+ double sl=buy?price-slPts*_Point:price+slPts*_Point,tp=buy?price+tpPts*_Point:price-tpPts*_Point;
+ double minLot=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN),maxLot=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX),step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);double vol=MathMax(minLot,MathMin(maxLot,InpLotSize));if(step>0)vol=MathFloor(vol/step)*step;
+ bool ok=buy?trade.Buy(vol,_Symbol,price,sl,tp,"ICT "+reason):trade.Sell(vol,_Symbol,price,sl,tp,"ICT "+reason);if(ok)tradesToday++;return ok;
 }
 //+------------------------------------------------------------------+
