@@ -1,0 +1,22 @@
+name: Workflow syntax test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  syntax-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify shell and Node syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          node - <<'NODE'
+          const fs = require('fs');
+          const sample = { ok: true, source: 'workflow' };
+          fs.writeFileSync('/tmp/xau.json', JSON.stringify(sample));
+          const j = JSON.parse(fs.readFileSync('/tmp/xau.json', 'utf8'));
+          if (!j.ok) throw new Error('Node syntax test failed');
+          console.log('Node heredoc syntax OK');
+          NODE
